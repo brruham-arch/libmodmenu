@@ -16,16 +16,18 @@ static void logf(const char* fmt, ...) {
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
 
+static jobject g_ctx      = nullptr;
+static jobject g_parentCL = nullptr;
+
 static void* init_thread(void*) {
     usleep(3000000);
     logf("[MM] thread start");
 
     JNIEnv* env = aml->GetJNIEnvironment();
-    if (!env) { logf("[MM] ERROR: env null"); return nullptr; }
-
-    jobject ctx = aml->GetAppContextObject();
-    if (!ctx) { logf("[MM] ERROR: ctx null"); return nullptr; }
-    logf("[MM] ctx: %p", ctx);
+    if (!env)      { logf("[MM] ERROR: env null"); return nullptr; }
+    if (!g_ctx)    { logf("[MM] ERROR: g_ctx null"); return nullptr; }
+    if (!g_parentCL){ logf("[MM] ERROR: g_parentCL null"); return nullptr; }
+    logf("[MM] env=%p ctx=%p cl=%p", env, g_ctx, g_parentCL);
 
     // Fix double slash
     const char* cfgPath = aml->GetConfigPath();
@@ -42,49 +44,7 @@ static void* init_thread(void*) {
     FILE* f = fopen(dexPath, "r");
     if (!f) { logf("[MM] ERROR: dex tidak ada"); return nullptr; }
     fclose(f);
-
-    // Ambil ClassLoader langsung dari object ctx
-    // ctx adalah jobject — cukup panggil getClassLoader() via reflection
-    jclass    clsObj  = env->FindClass("java/lang/Object");
-    jclass    clsCtx  = env->FindClass("android/content/Context");
-    if (!clsCtx || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        logf("[MM] ERROR: FindClass Context gagal");
-        return nullptr;
-    }
-    logf("[MM] FindClass Context OK");
-
-    jmethodID midGCL = env->GetMethodID(clsCtx, "getClassLoader",
-                           "()Ljava/lang/ClassLoader;");
-    if (!midGCL || env->ExceptionCheck()) {
-        env->ExceptionClear();
-        logf("[MM] ERROR: getClassLoader method null");
-        return nullptr;
-    }
-    logf("[MM] getClassLoader method OK");
-
-    jobject parentCL = env->CallObjectMethod(ctx, midGCL);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-        logf("[MM] ERROR: getClassLoader() threw exception");
-        return nullptr;
-    }
-    if (!parentCL) {
-        logf("[MM] WARN: parentCL null, coba Thread.currentThread().getContextClassLoader()");
-        // Fallback: ambil dari Thread saat ini
-        jclass    clsThread = env->FindClass("java/lang/Thread");
-        jmethodID midCT     = env->GetStaticMethodID(clsThread,
-                                  "currentThread", "()Ljava/lang/Thread;");
-        jmethodID midGCCL   = env->GetMethodID(clsThread,
-                                  "getContextClassLoader",
-                                  "()Ljava/lang/ClassLoader;");
-        jobject curThread = env->CallStaticObjectMethod(clsThread, midCT);
-        parentCL = env->CallObjectMethod(curThread, midGCCL);
-        logf("[MM] fallback parentCL: %p", parentCL);
-        if (!parentCL) { logf("[MM] ERROR: parentCL tetap null"); return nullptr; }
-    }
-    logf("[MM] parentCL OK: %p", parentCL);
+    logf("[MM] dex ada");
 
     // DexClassLoader
     jclass clsDCL = env->FindClass("dalvik/system/DexClassLoader");
@@ -105,7 +65,7 @@ static void* init_thread(void*) {
     jstring jDex = env->NewStringUTF(dexPath);
     jstring jOpt = env->NewStringUTF(optPath);
     jobject dcl  = env->NewObject(clsDCL, midDCLi,
-                       jDex, jOpt, (jstring)nullptr, parentCL);
+                       jDex, jOpt, (jstring)nullptr, g_parentCL);
     env->DeleteLocalRef(jDex);
     env->DeleteLocalRef(jOpt);
 
@@ -117,7 +77,6 @@ static void* init_thread(void*) {
     }
     logf("[MM] DCL instance OK");
 
-    // loadClass
     jmethodID midLC  = env->GetMethodID(clsDCL, "loadClass",
                            "(Ljava/lang/String;)Ljava/lang/Class;");
     jstring jClsName = env->NewStringUTF("com.brruham.modmenu.ModMenuHelper");
@@ -138,12 +97,49 @@ static void* init_thread(void*) {
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
+    g_ctx      = nullptr;
+    g_parentCL = nullptr;
     logf("[MM] OnModPreLoad OK");
 }
 
 ON_MOD_LOAD() {
     logf("[MM] OnModLoad");
+
+    // Ambil ctx dan ClassLoader di sini (main thread, paling aman)
+    JNIEnv* env = aml->GetJNIEnvironment();
+    if (!env) { logf("[MM] ERROR: env null di OnModLoad"); return; }
+
+    jobject ctx = aml->GetAppContextObject();
+    if (!ctx) { logf("[MM] ERROR: ctx null di OnModLoad"); return; }
+
+    // Simpan ctx sebagai global ref
+    g_ctx = env->NewGlobalRef(ctx);
+    logf("[MM] g_ctx: %p", g_ctx);
+
+    // Ambil ClassLoader dari ctx di main thread
+    jclass    clsCtx = env->FindClass("android/content/Context");
+    jmethodID midGCL = env->GetMethodID(clsCtx, "getClassLoader",
+                           "()Ljava/lang/ClassLoader;");
+    if (!midGCL || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        logf("[MM] ERROR: getClassLoader method null");
+        return;
+    }
+
+    jobject cl = env->CallObjectMethod(g_ctx, midGCL);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        logf("[MM] ERROR: getClassLoader() exception");
+        return;
+    }
+    if (!cl) { logf("[MM] ERROR: cl null"); return; }
+
+    g_parentCL = env->NewGlobalRef(cl);
+    logf("[MM] g_parentCL: %p", g_parentCL);
+
     pthread_t tid;
     if (pthread_create(&tid, nullptr, init_thread, nullptr) == 0)
         pthread_detach(tid);
+    logf("[MM] thread launched");
 }
