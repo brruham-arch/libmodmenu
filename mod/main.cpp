@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <jni.h>
 #include "mod/amlmod.h"
 
@@ -24,10 +25,10 @@ static void* init_thread(void*) {
     logf("[MM] thread start");
 
     JNIEnv* env = aml->GetJNIEnvironment();
-    if (!env)      { logf("[MM] ERROR: env null"); return nullptr; }
-    if (!g_ctx)    { logf("[MM] ERROR: g_ctx null"); return nullptr; }
-    if (!g_parentCL){ logf("[MM] ERROR: g_parentCL null"); return nullptr; }
-    logf("[MM] env=%p ctx=%p cl=%p", env, g_ctx, g_parentCL);
+    if (!env || !g_ctx || !g_parentCL) {
+        logf("[MM] ERROR: prereq null");
+        return nullptr;
+    }
 
     // Fix double slash
     const char* cfgPath = aml->GetConfigPath();
@@ -40,11 +41,22 @@ static void* init_thread(void*) {
     snprintf(dexPath, sizeof(dexPath), "%s/modmenu.dex", cleanCfg);
     snprintf(optPath, sizeof(optPath), "%s/modmenu_opt",  cleanCfg);
     logf("[MM] dex: %s", dexPath);
+    logf("[MM] opt: %s", optPath);
 
+    // Cek dex
     FILE* f = fopen(dexPath, "r");
     if (!f) { logf("[MM] ERROR: dex tidak ada"); return nullptr; }
     fclose(f);
     logf("[MM] dex ada");
+
+    // Buat optPath folder jika belum ada
+    struct stat st;
+    if (stat(optPath, &st) != 0) {
+        int r = mkdir(optPath, 0755);
+        logf("[MM] mkdir optPath: %d", r);
+    } else {
+        logf("[MM] optPath sudah ada");
+    }
 
     // DexClassLoader
     jclass clsDCL = env->FindClass("dalvik/system/DexClassLoader");
@@ -60,7 +72,7 @@ static void* init_thread(void*) {
         logf("[MM] ERROR: DCL.<init> gagal");
         return nullptr;
     }
-    logf("[MM] DCL ready");
+    logf("[MM] DCL class OK");
 
     jstring jDex = env->NewStringUTF(dexPath);
     jstring jOpt = env->NewStringUTF(optPath);
@@ -105,18 +117,13 @@ ON_MOD_PRELOAD() {
 ON_MOD_LOAD() {
     logf("[MM] OnModLoad");
 
-    // Ambil ctx dan ClassLoader di sini (main thread, paling aman)
     JNIEnv* env = aml->GetJNIEnvironment();
-    if (!env) { logf("[MM] ERROR: env null di OnModLoad"); return; }
+    if (!env) { logf("[MM] ERROR: env null"); return; }
 
     jobject ctx = aml->GetAppContextObject();
-    if (!ctx) { logf("[MM] ERROR: ctx null di OnModLoad"); return; }
-
-    // Simpan ctx sebagai global ref
+    if (!ctx) { logf("[MM] ERROR: ctx null"); return; }
     g_ctx = env->NewGlobalRef(ctx);
-    logf("[MM] g_ctx: %p", g_ctx);
 
-    // Ambil ClassLoader dari ctx di main thread
     jclass    clsCtx = env->FindClass("android/content/Context");
     jmethodID midGCL = env->GetMethodID(clsCtx, "getClassLoader",
                            "()Ljava/lang/ClassLoader;");
@@ -125,18 +132,14 @@ ON_MOD_LOAD() {
         logf("[MM] ERROR: getClassLoader method null");
         return;
     }
-
     jobject cl = env->CallObjectMethod(g_ctx, midGCL);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
+    if (!cl || env->ExceptionCheck()) {
         env->ExceptionClear();
-        logf("[MM] ERROR: getClassLoader() exception");
+        logf("[MM] ERROR: getClassLoader null");
         return;
     }
-    if (!cl) { logf("[MM] ERROR: cl null"); return; }
-
     g_parentCL = env->NewGlobalRef(cl);
-    logf("[MM] g_parentCL: %p", g_parentCL);
+    logf("[MM] ctx=%p cl=%p", g_ctx, g_parentCL);
 
     pthread_t tid;
     if (pthread_create(&tid, nullptr, init_thread, nullptr) == 0)
