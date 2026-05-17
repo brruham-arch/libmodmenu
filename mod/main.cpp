@@ -17,80 +17,20 @@ static void logf(const char* fmt, ...) {
     if (f) { fprintf(f, "%s\n", buf); fclose(f); }
 }
 
-static JavaVM* get_jvm() {
-    // Coba berbagai nama library
-    const char* libs[] = {
-        "libandroid_runtime.so",
-        "/system/lib/libandroid_runtime.so",
-        nullptr
-    };
-    for (int i = 0; libs[i]; i++) {
-        void* h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
-        if (!h) h = dlopen(libs[i], RTLD_LAZY | RTLD_GLOBAL);
-        if (!h) continue;
-        logf("[MM] loaded: %s", libs[i]);
-        auto fn = (jint(*)(JavaVM**, jsize, jsize*))
-                      dlsym(h, "JNI_GetCreatedJavaVMs");
-        if (!fn) { logf("[MM] sym not found di %s", libs[i]); continue; }
-        JavaVM* jvm = nullptr; jsize cnt = 0;
-        if (fn(&jvm, 1, &cnt) == JNI_OK && cnt > 0 && jvm) {
-            logf("[MM] jvm OK: %p", jvm);
-            return jvm;
-        }
-    }
-
-    // Fallback: cari di /proc/self/maps
-    logf("[MM] coba /proc/self/maps...");
-    FILE* maps = fopen("/proc/self/maps", "r");
-    if (!maps) return nullptr;
-    char line[512];
-    char libpath[256] = {};
-    while (fgets(line, sizeof(line), maps)) {
-        if (strstr(line, "libandroid_runtime.so")) {
-            char* p = strstr(line, "/");
-            if (p) {
-                int len = strlen(p);
-                if (len > 0 && p[len-1] == '\n') p[len-1] = '\0';
-                strncpy(libpath, p, sizeof(libpath)-1);
-                break;
-            }
-        }
-    }
-    fclose(maps);
-
-    if (libpath[0]) {
-        logf("[MM] maps found: %s", libpath);
-        void* h = dlopen(libpath, RTLD_NOW | RTLD_GLOBAL);
-        if (h) {
-            auto fn = (jint(*)(JavaVM**, jsize, jsize*))
-                          dlsym(h, "JNI_GetCreatedJavaVMs");
-            if (fn) {
-                JavaVM* jvm = nullptr; jsize cnt = 0;
-                if (fn(&jvm, 1, &cnt) == JNI_OK && cnt > 0 && jvm) {
-                    logf("[MM] jvm OK via maps: %p", jvm);
-                    return jvm;
-                }
-            }
-        }
-    }
-    return nullptr;
-}
+static JavaVM* g_jvm = nullptr;
 
 static void* init_thread(void*) {
     usleep(3000000);
     logf("[MM] thread start");
 
-    JavaVM* jvm = get_jvm();
-    if (!jvm) { logf("[MM] ERROR: jvm null"); return nullptr; }
+    if (!g_jvm) { logf("[MM] ERROR: g_jvm null"); return nullptr; }
 
     JNIEnv* env = nullptr;
-    if (jvm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
-        logf("[MM] ERROR: AttachCurrentThread gagal");
-        return nullptr;
-    }
-    logf("[MM] env OK: %p", env);
+    jint ret = g_jvm->AttachCurrentThread(&env, nullptr);
+    logf("[MM] AttachCurrentThread ret=%d env=%p", ret, env);
+    if (ret != JNI_OK || !env) { logf("[MM] ERROR: attach gagal"); return nullptr; }
 
-    // ClassLoader via Thread.currentThread()
+    // ClassLoader via Thread
     jclass    clsThread = env->FindClass("java/lang/Thread");
     jmethodID midCT     = env->GetStaticMethodID(clsThread, "currentThread",
                               "()Ljava/lang/Thread;");
@@ -102,7 +42,7 @@ static void* init_thread(void*) {
 
     if (!parentCL || env->ExceptionCheck()) {
         env->ExceptionClear();
-        logf("[MM] fallback: ClassLoader.getSystemClassLoader()");
+        logf("[MM] fallback: getSystemClassLoader");
         jclass    clsCL  = env->FindClass("java/lang/ClassLoader");
         jmethodID midSCL = env->GetStaticMethodID(clsCL, "getSystemClassLoader",
                                "()Ljava/lang/ClassLoader;");
@@ -111,11 +51,12 @@ static void* init_thread(void*) {
         if (!parentCL || env->ExceptionCheck()) {
             env->ExceptionClear();
             logf("[MM] ERROR: parentCL null");
-            jvm->DetachCurrentThread();
+            g_jvm->DetachCurrentThread();
             return nullptr;
         }
     }
 
+    // Path
     const char* cfgPath = aml->GetConfigPath();
     char cleanCfg[256];
     strncpy(cleanCfg, cfgPath, sizeof(cleanCfg)-1);
@@ -128,17 +69,18 @@ static void* init_thread(void*) {
     logf("[MM] dex: %s", dexPath);
 
     FILE* f = fopen(dexPath, "r");
-    if (!f) { logf("[MM] ERROR: dex tidak ada"); jvm->DetachCurrentThread(); return nullptr; }
+    if (!f) { logf("[MM] ERROR: dex tidak ada"); g_jvm->DetachCurrentThread(); return nullptr; }
     fclose(f);
 
     struct stat st;
     if (stat(optPath, &st) != 0) mkdir(optPath, 0755);
 
+    // DexClassLoader
     jclass clsDCL = env->FindClass("dalvik/system/DexClassLoader");
     if (!clsDCL || env->ExceptionCheck()) {
         env->ExceptionClear();
         logf("[MM] ERROR: FindClass DCL gagal");
-        jvm->DetachCurrentThread();
+        g_jvm->DetachCurrentThread();
         return nullptr;
     }
     jmethodID midDCLi = env->GetMethodID(clsDCL, "<init>",
@@ -146,7 +88,7 @@ static void* init_thread(void*) {
     if (!midDCLi || env->ExceptionCheck()) {
         env->ExceptionClear();
         logf("[MM] ERROR: DCL.<init> null");
-        jvm->DetachCurrentThread();
+        g_jvm->DetachCurrentThread();
         return nullptr;
     }
     logf("[MM] DCL ready");
@@ -162,7 +104,7 @@ static void* init_thread(void*) {
         env->ExceptionDescribe();
         env->ExceptionClear();
         logf("[MM] ERROR: NewObject DCL gagal");
-        jvm->DetachCurrentThread();
+        g_jvm->DetachCurrentThread();
         return nullptr;
     }
     logf("[MM] DCL instance OK");
@@ -177,23 +119,38 @@ static void* init_thread(void*) {
         env->ExceptionDescribe();
         env->ExceptionClear();
         logf("[MM] ERROR: loadClass gagal");
-        jvm->DetachCurrentThread();
+        g_jvm->DetachCurrentThread();
         return nullptr;
     }
     logf("[MM] loadClass OK!");
     aml->ShowToast(false, "[ModMenu] DEX loaded OK!");
-    jvm->DetachCurrentThread();
+    g_jvm->DetachCurrentThread();
     return nullptr;
 }
 
 ON_MOD_PRELOAD() {
     remove(LOGFILE);
+    g_jvm = nullptr;
     logf("[MM] OnModPreLoad OK");
 }
 
 ON_MOD_LOAD() {
     logf("[MM] OnModLoad");
+
+    // Ambil JVM dari env AML — paling reliable
+    JNIEnv* env = aml->GetJNIEnvironment();
+    if (!env) { logf("[MM] ERROR: env null"); return; }
+    logf("[MM] env: %p", env);
+
+    // GetJavaVM dari env langsung
+    JavaVM* jvm = nullptr;
+    jint ret = env->GetJavaVM(&jvm);
+    logf("[MM] GetJavaVM ret=%d jvm=%p", ret, jvm);
+    if (ret != JNI_OK || !jvm) { logf("[MM] ERROR: GetJavaVM gagal"); return; }
+    g_jvm = jvm;
+
     pthread_t tid;
     if (pthread_create(&tid, nullptr, init_thread, nullptr) == 0)
         pthread_detach(tid);
+    logf("[MM] thread launched");
 }
