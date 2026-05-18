@@ -96,7 +96,7 @@ static void* init_thread(void*) {
     jstring jDex = env->NewStringUTF(dexPath);
     jstring jOpt = env->NewStringUTF(optPath);
     jobject dcl  = env->NewObject(clsDCL, midDCLi,
-                       jDex, jOpt, (jstring)nullptr, parentCL);
+                       jDex, (jstring)nullptr, (jstring)nullptr, parentCL);
     env->DeleteLocalRef(jDex);
     env->DeleteLocalRef(jOpt);
 
