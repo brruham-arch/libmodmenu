@@ -18,7 +18,18 @@ static void logf(const char* fmt, ...) {
 }
 
 static JavaVM* g_jvm    = nullptr;
-static int     g_status = 0; // 0=idle, 1=ok, -1=fail
+static int     g_status = 0;
+
+// Native callbacks
+static void on_button  (JNIEnv*, jobject, jint id)             { aml->ShowToast(false, "Button %d", (int)id); }
+static void on_toggle  (JNIEnv*, jobject, jint id, jboolean s) { aml->ShowToast(false, "Toggle %d: %s", (int)id, s?"ON":"OFF"); }
+static void on_slider  (JNIEnv*, jobject, jint id, jint v)     { aml->ShowToast(false, "Slider %d: %d", (int)id, (int)v); }
+static void on_checkbox(JNIEnv*, jobject, jint id, jboolean s) { aml->ShowToast(false, "CheckBox %d: %s", (int)id, s?"true":"false"); }
+static void on_edit(JNIEnv* env, jobject, jint id, jstring jt) {
+    const char* t = env->GetStringUTFChars(jt, nullptr);
+    aml->ShowToast(false, "Input %d: %s", (int)id, t);
+    env->ReleaseStringUTFChars(jt, t);
+}
 
 static void* init_thread(void*) {
     usleep(2000000);
@@ -31,6 +42,7 @@ static void* init_thread(void*) {
         logf("[MM] ERROR: attach gagal"); g_status = -1; return nullptr;
     }
 
+    // ClassLoader
     jclass    clsCL  = env->FindClass("java/lang/ClassLoader");
     jmethodID midSCL = env->GetStaticMethodID(clsCL, "getSystemClassLoader",
                            "()Ljava/lang/ClassLoader;");
@@ -41,6 +53,7 @@ static void* init_thread(void*) {
         g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
     }
 
+    // Path
     const char* cfgPath = aml->GetConfigPath();
     char cleanCfg[256];
     strncpy(cleanCfg, cfgPath, sizeof(cleanCfg)-1);
@@ -56,13 +69,13 @@ static void* init_thread(void*) {
     struct stat st;
     if (stat(optPath, &st) != 0) mkdir(optPath, 0755);
 
+    // DexClassLoader
     jclass    clsDCL  = env->FindClass("dalvik/system/DexClassLoader");
     jmethodID midInit = env->GetMethodID(clsDCL, "<init>",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V");
     jstring jDex = env->NewStringUTF(dexPath);
     jstring jOpt = env->NewStringUTF(optPath);
-    jobject dcl  = env->NewObject(clsDCL, midInit,
-                       jDex, jOpt, (jstring)nullptr, parentCL);
+    jobject dcl  = env->NewObject(clsDCL, midInit, jDex, jOpt, (jstring)nullptr, parentCL);
     env->DeleteLocalRef(jDex);
     env->DeleteLocalRef(jOpt);
     if (!dcl || env->ExceptionCheck()) {
@@ -70,6 +83,7 @@ static void* init_thread(void*) {
         logf("[MM] ERROR: DCL gagal"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
     }
 
+    // loadClass
     jmethodID midLC = env->GetMethodID(clsDCL, "loadClass",
                           "(Ljava/lang/String;)Ljava/lang/Class;");
     jstring   jCls  = env->NewStringUTF("com.brruham.modmenu.ModMenuHelper");
@@ -80,6 +94,46 @@ static void* init_thread(void*) {
         logf("[MM] ERROR: loadClass gagal"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
     }
     logf("[MM] loadClass OK");
+
+    // RegisterNatives
+    JNINativeMethod methods[] = {
+        { "nativeOnButton",      "(I)V",                   (void*)on_button   },
+        { "nativeOnToggle",      "(IZ)V",                  (void*)on_toggle   },
+        { "nativeOnSlider",      "(II)V",                  (void*)on_slider   },
+        { "nativeOnCheckBox",    "(IZ)V",                  (void*)on_checkbox },
+        { "nativeOnEditConfirm", "(ILjava/lang/String;)V", (void*)on_edit     },
+    };
+    if (env->RegisterNatives(cls, methods, 5) != 0 || env->ExceptionCheck()) {
+        env->ExceptionDescribe(); env->ExceptionClear();
+        logf("[MM] ERROR: RegisterNatives gagal"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
+    }
+    logf("[MM] RegisterNatives OK");
+
+    // Context
+    jobject ctx = aml->GetAppContextObject();
+    if (!ctx) { logf("[MM] ERROR: ctx null"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr; }
+
+    // NewObject ModMenuHelper
+    jmethodID midCtor = env->GetMethodID(cls, "<init>", "(Landroid/content/Context;)V");
+    if (!midCtor || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        logf("[MM] ERROR: ctor null"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
+    }
+    jobject helper = env->NewObject(cls, midCtor, ctx);
+    if (!helper || env->ExceptionCheck()) {
+        env->ExceptionDescribe(); env->ExceptionClear();
+        logf("[MM] ERROR: NewObject helper gagal"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
+    }
+    logf("[MM] helper OK");
+
+    // Panggil show() — ini post ke UI thread via Handler internal ModMenuHelper
+    jmethodID midShow = env->GetMethodID(cls, "show", "()V");
+    env->CallVoidMethod(helper, midShow);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe(); env->ExceptionClear();
+        logf("[MM] ERROR: show() exception"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
+    }
+    logf("[MM] show() OK");
 
     g_jvm->DetachCurrentThread();
     g_status = 1;
@@ -97,26 +151,20 @@ ON_MOD_LOAD() {
     JNIEnv* env = aml->GetJNIEnvironment();
     if (!env) { logf("[MM] ERROR: env null"); return; }
     env->GetJavaVM(&g_jvm);
-    logf("[MM] jvm: %p", g_jvm);
-
     pthread_t tid;
     if (pthread_create(&tid, nullptr, init_thread, nullptr) == 0)
         pthread_detach(tid);
 }
 
-// Dipanggil AML di main thread setelah semua mod loaded — aman untuk ShowToast
 ON_ALL_MODS_LOAD() {
-    logf("[MM] OnAllModsLoaded, status=%d", g_status);
-    // Tunggu init_thread selesai (max 5 detik)
-    for (int i = 0; i < 50; i++) {
+    // Tunggu init_thread max 8 detik
+    for (int i = 0; i < 80; i++) {
         if (g_status != 0) break;
         usleep(100000);
     }
-    if (g_status == 1) {
-        aml->ShowToast(false, "[ModMenu] DEX loaded OK!");
-        logf("[MM] toast OK");
-    } else {
-        aml->ShowToast(true, "[ModMenu] Gagal! cek log.");
-        logf("[MM] toast FAIL status=%d", g_status);
-    }
+    if (g_status == 1)
+        aml->ShowToast(false, "[ModMenu] Aktif! Tap ☰ untuk buka panel");
+    else
+        aml->ShowToast(true, "[ModMenu] Gagal! status=%d", g_status);
+    logf("[MM] OnAllModsLoaded status=%d", g_status);
 }
