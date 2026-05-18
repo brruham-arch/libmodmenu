@@ -21,7 +21,7 @@ static JavaVM* g_jvm    = nullptr;
 static int     g_status = 0; // 0=idle, 1=ok, -1=fail
 
 static void* init_thread(void*) {
-    usleep(3000000);
+    usleep(2000000);
     logf("[MM] thread start");
 
     if (!g_jvm) { logf("[MM] ERROR: g_jvm null"); g_status = -1; return nullptr; }
@@ -70,10 +70,10 @@ static void* init_thread(void*) {
         logf("[MM] ERROR: DCL gagal"); g_jvm->DetachCurrentThread(); g_status = -1; return nullptr;
     }
 
-    jmethodID midLC  = env->GetMethodID(clsDCL, "loadClass",
-                           "(Ljava/lang/String;)Ljava/lang/Class;");
-    jstring   jCls   = env->NewStringUTF("com.brruham.modmenu.ModMenuHelper");
-    jclass    cls    = (jclass)env->CallObjectMethod(dcl, midLC, jCls);
+    jmethodID midLC = env->GetMethodID(clsDCL, "loadClass",
+                          "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring   jCls  = env->NewStringUTF("com.brruham.modmenu.ModMenuHelper");
+    jclass    cls   = (jclass)env->CallObjectMethod(dcl, midLC, jCls);
     env->DeleteLocalRef(jCls);
     if (!cls || env->ExceptionCheck()) {
         env->ExceptionDescribe(); env->ExceptionClear();
@@ -82,23 +82,7 @@ static void* init_thread(void*) {
     logf("[MM] loadClass OK");
 
     g_jvm->DetachCurrentThread();
-    g_status = 1; // sinyal ke polling loop bahwa DEX berhasil
-    return nullptr;
-}
-
-// Polling loop di main thread — aman untuk ShowToast
-static void* toast_poll_thread(void*) {
-    for (int i = 0; i < 100; i++) { // max 10 detik
-        usleep(100000);
-        if (g_status == 1) {
-            aml->ShowToast(false, "[ModMenu] DEX loaded OK!");
-            logf("[MM] toast OK");
-            return nullptr;
-        } else if (g_status == -1) {
-            aml->ShowToast(true, "[ModMenu] Gagal load DEX!");
-            return nullptr;
-        }
-    }
+    g_status = 1;
     return nullptr;
 }
 
@@ -115,9 +99,24 @@ ON_MOD_LOAD() {
     env->GetJavaVM(&g_jvm);
     logf("[MM] jvm: %p", g_jvm);
 
-    pthread_t tid1, tid2;
-    if (pthread_create(&tid1, nullptr, init_thread, nullptr) == 0)
-        pthread_detach(tid1);
-    if (pthread_create(&tid2, nullptr, toast_poll_thread, nullptr) == 0)
-        pthread_detach(tid2);
+    pthread_t tid;
+    if (pthread_create(&tid, nullptr, init_thread, nullptr) == 0)
+        pthread_detach(tid);
+}
+
+// Dipanggil AML di main thread setelah semua mod loaded — aman untuk ShowToast
+ON_ALL_MODS_LOAD() {
+    logf("[MM] OnAllModsLoaded, status=%d", g_status);
+    // Tunggu init_thread selesai (max 5 detik)
+    for (int i = 0; i < 50; i++) {
+        if (g_status != 0) break;
+        usleep(100000);
+    }
+    if (g_status == 1) {
+        aml->ShowToast(false, "[ModMenu] DEX loaded OK!");
+        logf("[MM] toast OK");
+    } else {
+        aml->ShowToast(true, "[ModMenu] Gagal! cek log.");
+        logf("[MM] toast FAIL status=%d", g_status);
+    }
 }
